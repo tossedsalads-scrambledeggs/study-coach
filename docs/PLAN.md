@@ -65,8 +65,10 @@ app/api/**         thin REST routes over services (JSON in/out, 400 on bad input
 app/(app)/**       pages
 ```
 
-Agents never call each other. Services talk through the database. The chat and the mail coach call
-services through the interfaces in `lib/contracts.ts` only.
+Agents never call each other. Services talk through the database. The coach chat (T6) calls the
+other features only through the REST routes below (server-side `fetch` to its own origin), so it
+works before they are merged. The mail coach (T5) and shuffle (T4) import services through the
+interfaces in `lib/contracts.ts`.
 
 ### REST API
 
@@ -103,7 +105,7 @@ change, a shared component)? Open a `question` issue and keep going on what you 
 | T3 Method quiz | `lib/agents/methodQuiz.ts`, `lib/services/quiz.ts`, `lib/services/methodLines.ts`, `app/api/quiz/**`, `app/api/method-lines/**`, `app/(app)/methods/**` | Gateway, Neon (pgvector) |
 | T4 Shuffle | `lib/agents/shuffle.ts`, `lib/services/shuffle.ts`, `app/api/shuffle/**` | Gateway, Neon |
 | T5 Mail coach | `lib/agentmail.ts`, `lib/agents/mailCoach.ts`, `app/api/mail/**` | AgentMail, Neon |
-| T6 Coach UI | `app/(app)/layout.tsx`, `app/(app)/page.tsx`, `app/(app)/quiz/**`, `app/(app)/shuffle/**`, `app/api/chat/**`, `components/coach/**`, `components/tool-ui/**`; deletes `app/page.tsx`, `app/assistant.tsx` | assistant-ui |
+| T6 Coach UI | `app/(app)/layout.tsx`, `app/(app)/page.tsx`, `app/(app)/quiz/**`, `app/(app)/log/**`, `app/(app)/shuffle/**`, `app/api/chat/**`, `components/coach/**`, `components/tool-ui/**`; deletes `app/page.tsx`, `app/assistant.tsx` | assistant-ui |
 | Tests | `tests/<task>/**` only (test writer) | |
 | Orchestrator | everything else: `lib/contracts.ts`, `lib/rules.ts`, `lib/llm.ts`, `lib/db.ts`, `db/`, `docs/`, `package.json`, configs, `components/ui/**` | |
 
