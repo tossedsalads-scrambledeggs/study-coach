@@ -132,7 +132,10 @@ No agent calls another. Each reads the board and the repo, and writes only its o
 ## 6. Coding rules
 
 - Never print, log, commit or paste secrets. Read env vars by name only. `.env` stays local.
-- All model calls: `chat`, `llmJSON`, `embed` from `@/lib/llm`. All SQL: `query` from `@/lib/db`.
+- All model calls go through the Neon AI Gateway: `chat`, `llmJSON`, `embed` from `@/lib/llm` (the coach
+  chat streams through the same gateway via `@ai-sdk/openai-compatible`). All SQL: `query` from
+  `@/lib/db`; a multi-statement write runs in one transaction on a client from `db().connect()`
+  (begin / commit / rollback, release in `finally`) so it never leaves data half-written.
   Default to `MODELS.smart` for diagnosis, planning and problem writing; `MODELS.fast` for grading and
   quiz questions.
 - Agents (`lib/agents/*`) take plain inputs and return the contract type; they never touch the DB, so
