@@ -28,9 +28,51 @@ async function post(path: string, body: unknown): Promise<any> {
   return res.json();
 }
 
+/** Streams the completion: the gateway answers 504 on non-streaming calls that run past ~60 s.
+ *  A dropped stream or a 5xx is retried once, since both are usually transient. */
 export async function chat(messages: ChatMessage[], opts: { model?: string } = {}): Promise<string> {
-  const data = await post("/chat/completions", { model: opts.model ?? MODELS.smart, messages });
-  return data.choices?.[0]?.message?.content ?? "";
+  try {
+    return await streamChat(messages, opts.model ?? MODELS.smart);
+  } catch (err) {
+    if (!/stream_interrupted|stream error|AI Gateway 5\d\d/.test(String(err))) throw err;
+    return streamChat(messages, opts.model ?? MODELS.smart);
+  }
+}
+
+async function streamChat(messages: ChatMessage[], model: string): Promise<string> {
+  const { base, token } = gateway();
+  const res = await fetch(`${base}/v1/chat/completions`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", Accept: "text/event-stream" },
+    body: JSON.stringify({ model, messages, stream: true }),
+  });
+  if (!res.ok || !res.body) throw new Error(`AI Gateway ${res.status}: ${(await res.text()).slice(0, 300)}`);
+
+  const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
+  let buffer = "";
+  let text = "";
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += value;
+    let newline: number;
+    while ((newline = buffer.indexOf("\n")) >= 0) {
+      const line = buffer.slice(0, newline).trim();
+      buffer = buffer.slice(newline + 1);
+      if (!line.startsWith("data:")) continue;
+      const data = line.slice(5).trim();
+      if (data === "[DONE]") return text;
+      let chunk: any;
+      try {
+        chunk = JSON.parse(data);
+      } catch {
+        continue; // keep-alive or a partial frame
+      }
+      if (chunk.error) throw new Error(`AI Gateway stream error: ${JSON.stringify(chunk.error).slice(0, 300)}`);
+      text += chunk.choices?.[0]?.delta?.content ?? "";
+    }
+  }
+  return text;
 }
 
 /** Pull the outermost JSON object out of a model reply (tolerates code fences and stray prose). */

@@ -19,72 +19,83 @@ const RequestSchema = z.object({
   messages: z.array(z.unknown()),
 });
 
+/** The app is public, so a failure never returns raw exception text (hosts, gateway bodies): log it here, say this. */
+const GENERIC_ERROR = "Something went wrong. Please try again.";
+
+function logFailure(what: string, detail: unknown) {
+  const text = detail instanceof Error ? detail.message : String(detail);
+  console.error(`[chat] ${what}: ${text.slice(0, 300)}`);
+}
+
 // ---------------------------------------------------------------------------
-// Calling the other features: REST routes only, server-side, on our own origin.
+// Calling the other features: REST routes only, server-side, on this server's own internal address.
 // ---------------------------------------------------------------------------
 
 type ApiResult = Record<string, unknown>;
 
 /**
- * Our own origin first (what the request came in on). Behind a proxy that origin can redirect or refuse a
- * server-side call, so the local port is the fallback; it is only tried on network errors and redirects.
+ * Where the tools reach the other features' REST routes: this server, on a fixed internal address.
+ * Never derived from the incoming request (its Host header is client-controlled, so using it would let a
+ * caller point the server at any host), and never tried on a second origin (a retried POST could write twice).
  */
-function originsFor(req: Request): string[] {
-  const own = new URL(req.url).origin;
-  const local = `http://127.0.0.1:${process.env.PORT ?? "3000"}`;
-  return own === local ? [own] : [own, local];
+function internalOrigin(): string {
+  return process.env.INTERNAL_ORIGIN ?? `http://127.0.0.1:${process.env.PORT ?? "3000"}`;
 }
 
+/**
+ * One request, one attempt. A redirect is an error (it is never followed), and so is any thrown network
+ * error: both come back as { error } for the tool card to show.
+ */
 async function callApi(
-  origins: string[],
+  origin: string,
   path: string,
   init: { method?: "GET" | "POST"; body?: unknown } = {},
   signal?: AbortSignal,
 ): Promise<ApiResult> {
   const hasBody = init.body !== undefined;
-  let failure = "The request failed.";
-
-  for (const origin of origins) {
-    try {
-      const res = await fetch(new URL(path, origin), {
-        method: init.method ?? "GET",
-        headers: hasBody ? { "Content-Type": "application/json" } : undefined,
-        body: hasBody ? JSON.stringify(init.body) : undefined,
-        cache: "no-store",
-        redirect: "manual",
-        signal,
-      });
-      if (res.status >= 300 && res.status < 400) {
-        failure = `The request was redirected (${res.status}).`;
-        continue;
-      }
-      const text = await res.text();
-      let data: unknown = null;
-      try {
-        data = text ? JSON.parse(text) : null;
-      } catch {
-        data = null;
-      }
-      const record: ApiResult =
-        data && typeof data === "object" && !Array.isArray(data)
-          ? (data as ApiResult)
-          : data === null
-            ? {}
-            : { data };
-      if (!res.ok) {
-        const message =
-          typeof record.error === "string" && record.error
-            ? record.error
-            : `The request failed (${res.status}).`;
-        return { error: message, status: res.status };
-      }
-      return record;
-    } catch (err) {
-      if (signal?.aborted) return { error: "The request was cancelled." };
-      failure = err instanceof Error ? err.message : failure;
+  try {
+    const res = await fetch(new URL(path, origin), {
+      method: init.method ?? "GET",
+      headers: hasBody ? { "Content-Type": "application/json" } : undefined,
+      body: hasBody ? JSON.stringify(init.body) : undefined,
+      cache: "no-store",
+      redirect: "manual",
+      signal,
+    });
+    if (res.status >= 300 && res.status < 400) {
+      logFailure("tool route redirected instead of answering", `${path} -> ${res.status}`);
+      return { error: GENERIC_ERROR, status: res.status };
     }
+    const text = await res.text();
+    let data: unknown = null;
+    try {
+      data = text ? JSON.parse(text) : null;
+    } catch {
+      data = null;
+    }
+    const record: ApiResult =
+      data && typeof data === "object" && !Array.isArray(data)
+        ? (data as ApiResult)
+        : data === null
+          ? {}
+          : { data };
+    if (!res.ok) {
+      // 4xx messages are deliberate and user-facing (validation, "No course yet", "Duplicate of: ...").
+      // A 5xx is never passed on: whatever it carries stays in the server log.
+      if (res.status >= 500) {
+        logFailure(`tool route failed (${res.status})`, `${path}: ${typeof record.error === "string" ? record.error : ""}`);
+        return { error: GENERIC_ERROR, status: res.status };
+      }
+      const message =
+        typeof record.error === "string" && record.error ? record.error : `The request failed (${res.status}).`;
+      return { error: message, status: res.status };
+    }
+    return record;
+  } catch (err) {
+    if (signal?.aborted) return { error: "The request was cancelled." };
+    logFailure("tool request threw", err);
+    return { error: GENERIC_ERROR };
   }
-  return { error: failure };
 }
 
 const isFailure = (r: ApiResult): boolean => typeof r.error === "string";
@@ -97,8 +108,8 @@ function compact<T extends Record<string, unknown>>(input: T): Partial<T> {
 }
 
 /** Best-effort: the method line behind a quiz question, so the grade card can show its trap. */
-async function lookupLine(origins: string[], id: string, signal?: AbortSignal) {
-  const res = await callApi(origins, "/api/method-lines", {}, signal);
+async function lookupLine(origin: string, id: string, signal?: AbortSignal) {
+  const res = await callApi(origin, "/api/method-lines", {}, signal);
   if (isFailure(res) || !Array.isArray(res.lines)) return null;
   const line = (res.lines as Record<string, unknown>[]).find((l) => l?.id === id);
   if (!line) return null;
@@ -123,7 +134,7 @@ const problemFields = {
   lecture: z.string().optional().describe('The lecture, e.g. "Lec 5". Omit when the student does not know it'),
 };
 
-function toolsFor(mode: Mode, origins: string[]): ToolSet {
+function toolsFor(mode: Mode, origin: string): ToolSet {
   switch (mode) {
     case "quiz":
       return {
@@ -133,7 +144,7 @@ function toolsFor(mode: Mode, origins: string[]): ToolSet {
             "Returns { question: { methodLineId, unitNumber, question } }, or { done: true } when every line in reach is passed.",
           inputSchema: z.object({}),
           execute: async (_input, { abortSignal }) =>
-            callApi(origins, "/api/quiz/next", { method: "POST" }, abortSignal),
+            callApi(origin, "/api/quiz/next", { method: "POST" }, abortSignal),
         }),
         grade_quiz_answer: tool({
           description:
@@ -145,9 +156,9 @@ function toolsFor(mode: Mode, origins: string[]): ToolSet {
             answer: z.string().min(1).describe("The student's answer, verbatim"),
           }),
           execute: async (input, { abortSignal }) => {
-            const grade = await callApi(origins, "/api/quiz/answer", { method: "POST", body: input }, abortSignal);
+            const grade = await callApi(origin, "/api/quiz/answer", { method: "POST", body: input }, abortSignal);
             if (isFailure(grade)) return grade;
-            const line = await lookupLine(origins, input.methodLineId, abortSignal);
+            const line = await lookupLine(origin, input.methodLineId, abortSignal);
             return line ? { ...grade, line } : grade;
           },
         }),
@@ -164,21 +175,21 @@ function toolsFor(mode: Mode, origins: string[]): ToolSet {
             studentApproach: z.string().min(1).describe("What the student actually did, in their own words"),
           }),
           execute: async (input, { abortSignal }) =>
-            callApi(origins, "/api/errors", { method: "POST", body: compact(input) }, abortSignal),
+            callApi(origin, "/api/errors", { method: "POST", body: compact(input) }, abortSignal),
         }),
         approve_method_line: tool({
           description:
             "Approve a proposed method line so it joins the method sheet. Use only when the student says in chat that they approve it.",
           inputSchema: z.object({ lineId: z.string().describe("pendingLine.id from the log_error result") }),
           execute: async ({ lineId }, { abortSignal }) =>
-            callApi(origins, `/api/method-lines/${encodeURIComponent(lineId)}/approve`, { method: "POST" }, abortSignal),
+            callApi(origin, `/api/method-lines/${encodeURIComponent(lineId)}/approve`, { method: "POST" }, abortSignal),
         }),
         reject_method_line: tool({
           description:
             "Reject a proposed method line. Use only when the student says in chat that they do not want it.",
           inputSchema: z.object({ lineId: z.string().describe("pendingLine.id from the log_error result") }),
           execute: async ({ lineId }, { abortSignal }) =>
-            callApi(origins, `/api/method-lines/${encodeURIComponent(lineId)}/reject`, { method: "POST" }, abortSignal),
+            callApi(origin, `/api/method-lines/${encodeURIComponent(lineId)}/reject`, { method: "POST" }, abortSignal),
         }),
         log_correct_problem: tool({
           description:
@@ -188,7 +199,7 @@ function toolsFor(mode: Mode, origins: string[]): ToolSet {
             answer: z.string().optional().describe("The correct answer, if the student gave one"),
           }),
           execute: async (input, { abortSignal }) =>
-            callApi(origins, "/api/problems/correct", { method: "POST", body: compact(input) }, abortSignal),
+            callApi(origin, "/api/problems/correct", { method: "POST", body: compact(input) }, abortSignal),
         }),
       };
 
@@ -200,7 +211,7 @@ function toolsFor(mode: Mode, origins: string[]): ToolSet {
             "Returns { itemId, problemId, statement }, or { done: true } when the pile is empty.",
           inputSchema: z.object({}),
           execute: async (_input, { abortSignal }) =>
-            callApi(origins, "/api/shuffle/next", { method: "POST" }, abortSignal),
+            callApi(origin, "/api/shuffle/next", { method: "POST" }, abortSignal),
         }),
         grade_shuffle_answer: tool({
           description:
@@ -212,7 +223,7 @@ function toolsFor(mode: Mode, origins: string[]): ToolSet {
             answer: z.string().min(1).describe("The student's answer, verbatim"),
           }),
           execute: async (input, { abortSignal }) =>
-            callApi(origins, "/api/shuffle/answer", { method: "POST", body: input }, abortSignal),
+            callApi(origin, "/api/shuffle/answer", { method: "POST", body: input }, abortSignal),
         }),
       };
   }
@@ -234,7 +245,7 @@ const PROMPTS: Record<Mode, string> = {
 You are running the Method Quiz. A method line is: a trigger inside a problem, the move to make, and the trap to avoid.
 Run it one question at a time:
 1. Call next_quiz_question to get a fresh scenario. Never write quiz questions yourself. After the card appears, say at most "Your move." and wait.
-2. Do not hint at, name or lead toward the move or the trap before the student has answered and been graded. If they ask for the answer first, ask them to take a guess; a first instinct is fine.
+2. Never answer the question yourself, and never call grade_quiz_answer in the same reply as next_quiz_question: the answer must come from the student's next message. Do not hint at, name or lead toward the move or the trap before the student has answered and been graded. If they ask for the answer first, ask them to take a guess; a first instinct is fine.
 3. When the student answers, call grade_quiz_answer with the methodLineId and question from the latest next_quiz_question result and their answer word for word.
 4. After the grade card appears, reply in one short sentence that does not repeat or paraphrase the feedback, for example "Nice, that one is retired. Ready for another?" or "Not yet. Want to try another?" Only call next_quiz_question again when the student asks to continue (for example "yes", "next", "another").
 If next_quiz_question returns { done: true }, congratulate them and suggest logging a mistake or trying the shuffle pile.`,
@@ -254,7 +265,7 @@ Do not log the same problem twice.`,
 You are running the Shuffle Pile: new problems that use the same method as ones the student has solved before, with new surface details.
 Run it one problem at a time:
 1. Call next_shuffle_problem. Never write problems yourself. After the card appears, say at most "Your move." and wait.
-2. Never give hints, methods, steps or answers before the student has answered and been graded.
+2. Never solve the problem yourself, and never call grade_shuffle_answer in the same reply as next_shuffle_problem: the answer must come from the student's next message. Never give hints, methods, steps or answers before the student has answered and been graded.
 3. When the student answers, call grade_shuffle_answer with the itemId and problemId from the latest next_shuffle_problem result and their answer word for word.
 4. After the grade card appears, reply in one short sentence that does not repeat the feedback, for example "Nice, that one is cleared. Ready for another?" If they missed it and the result has an errorLogId, say it went into their error log for a re-drill. Only call next_shuffle_problem again when the student asks to continue.
 If next_shuffle_problem returns { done: true }, tell them the pile is empty for now and that cleared problems will show up here.`,
@@ -284,7 +295,8 @@ export async function POST(req: Request) {
   const baseURL = process.env.NEON_AI_GATEWAY_BASE_URL;
   const apiKey = process.env.NEON_AI_GATEWAY_TOKEN;
   if (!baseURL || !apiKey) {
-    return jsonError("The coach is not connected to the AI gateway yet (gateway settings are missing).", 500);
+    logFailure("not configured", "NEON_AI_GATEWAY_BASE_URL or NEON_AI_GATEWAY_TOKEN is not set");
+    return jsonError(GENERIC_ERROR, 500);
   }
 
   const gateway = createOpenAICompatible({
@@ -293,11 +305,11 @@ export async function POST(req: Request) {
     apiKey,
   });
 
-  const tools = toolsFor(mode, originsFor(req));
+  const tools = toolsFor(mode, internalOrigin());
 
   try {
     const result = streamText({
-      model: gateway("gpt-5-mini"),
+      model: gateway(process.env.MODEL_CHAT?.trim() || "gpt-5-mini"),
       system: PROMPTS[mode],
       messages: await convertToModelMessages(messages as UIMessage[], {
         tools,
@@ -310,12 +322,12 @@ export async function POST(req: Request) {
 
     return result.toUIMessageStreamResponse({
       onError: (error) => {
-        const text = error instanceof Error ? error.message : String(error);
-        return text.split(apiKey).join("[hidden]").slice(0, 300);
+        logFailure("model stream failed", error);
+        return GENERIC_ERROR;
       },
     });
   } catch (err) {
-    const text = err instanceof Error ? err.message : "Something went wrong.";
-    return jsonError(text.split(apiKey).join("[hidden]").slice(0, 300), 500);
+    logFailure("could not start the model call", err);
+    return jsonError(GENERIC_ERROR, 500);
   }
 }

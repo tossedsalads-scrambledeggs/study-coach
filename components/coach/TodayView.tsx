@@ -17,6 +17,7 @@ import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
 import { useCourse, type CourseState } from "./CourseContext";
+import { EmailQuestions } from "./EmailQuestions";
 import { useFetchJson, type FetchState } from "./useFetchJson";
 
 type DueBody = { entries?: (Partial<ErrorLogEntry> & { statement?: string })[] };
@@ -132,6 +133,19 @@ function TodaySkeleton() {
   );
 }
 
+type TrackerRow = { unitNumber: number; total: number; passed: number };
+
+/**
+ * The lines the quiz can actually ask: units up to the current unit, not yet passed. The tracker lists every
+ * unit, so without the current unit it cannot be narrowed and every row counts.
+ */
+export function linesInReach(rows: TrackerRow[], currentUnit: number | null) {
+  const inReach = currentUnit == null ? rows : rows.filter((r) => r.unitNumber <= currentUnit);
+  const total = inReach.reduce((n, r) => n + r.total, 0);
+  const passed = inReach.reduce((n, r) => n + r.passed, 0);
+  return { total, passed, left: Math.max(total - passed, 0) };
+}
+
 type Loadable<T> = FetchState<T> & { reload: () => void };
 
 export type TodayContentProps = {
@@ -145,6 +159,7 @@ export type TodayContentProps = {
 /** Everything on the Today page, driven by plain props so every state can be rendered and checked. */
 export function TodayContent({ course, due, tracker, errors, dateLabel }: TodayContentProps) {
   const view = course.state.status === "ready" ? course.state.view : null;
+  const currentUnit = view?.currentUnit ?? null;
   const unitTitle = view?.units?.find((u) => u.number === view.currentUnit)?.title ?? null;
   const dueEntries = due.status === "ready" ? (due.data.entries ?? []) : [];
 
@@ -202,21 +217,21 @@ export function TodayContent({ course, due, tracker, errors, dateLabel }: TodayC
               onRetry={tracker.reload}
               render={() => {
                 const rows = tracker.status === "ready" ? (tracker.data.byUnit ?? []) : [];
-                const total = rows.reduce((n, r) => n + r.total, 0);
-                const passed = rows.reduce((n, r) => n + r.passed, 0);
+                const { total, passed, left } = linesInReach(rows, currentUnit);
+                const reach = currentUnit == null ? "" : currentUnit === 1 ? " in Unit 1" : ` in Units 1 to ${currentUnit}`;
                 return {
-                  value: Math.max(total - passed, 0),
+                  value: left,
                   caption:
                     total === 0
                       ? "No method lines in reach yet."
-                      : `${passed} of ${total} ${plural(total, "line", "lines")} passed so far.`,
+                      : `${passed} of ${total} ${plural(total, "line", "lines")} passed${reach}.`,
                 };
               }}
             />
             <StatCard
               href="/shuffle"
               icon={ShuffleIcon}
-              title="Shuffle pile"
+              title="Problems cleared"
               cta="Open shuffle pile"
               state={errors}
               onRetry={errors.reload}
@@ -226,8 +241,8 @@ export function TodayContent({ course, due, tracker, errors, dateLabel }: TodayC
                   value: cleared,
                   caption:
                     cleared === 0
-                      ? "Clear a re-drill and the problem lands here as a fresh variant."
-                      : `${plural(cleared, "problem", "problems")} cleared. Each can come back with a new surface.`,
+                      ? "Clear a re-drill and the problem lands in your shuffle pile."
+                      : `${plural(cleared, "problem", "problems")} cleared. Each can come back in your shuffle pile as a new problem.`,
                 };
               }}
             />
@@ -270,6 +285,8 @@ export function TodayContent({ course, due, tracker, errors, dateLabel }: TodayC
               </ul>
             </section>
           ) : null}
+
+          <EmailQuestions />
 
           <section aria-labelledby="quick-heading" className="space-y-3">
             <h2 id="quick-heading" className="text-lg font-semibold tracking-tight">
