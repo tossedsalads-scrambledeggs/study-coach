@@ -22,7 +22,7 @@ echo "== install + build"
 run "cd $APP && npm ci --no-audit --no-fund --loglevel=error && npm run build 2>&1 | tail -15"
 
 echo "== service on port 8080 (wakes on request)"
-run "if sprite-env services get web >/dev/null 2>&1; then sprite-env services restart web --duration 10s; else sprite-env services create web --cmd \$(command -v npm) --args 'run,start,--,-p,8080' --dir $APP --http-port 8080 --duration 10s; fi" | tail -5
+run "sprite-env services delete web >/dev/null 2>&1; sprite-env services create web --cmd \$(command -v npm) --args 'run,start,--,-p,8080' --env PORT=8080 --dir $APP --http-port 8080 --duration 10s" | tail -5
 
 echo "== public URL"
 "$SPRITE_CLI" config update --url-auth public -s "$SPRITE" >/dev/null 2>&1 || "$SPRITE_CLI" url update --auth public -s "$SPRITE" >/dev/null 2>&1 || true
