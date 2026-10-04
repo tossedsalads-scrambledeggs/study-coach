@@ -6,8 +6,7 @@ export async function POST(_req?: Request) {
     const question = await nextQuizQuestion();
     return Response.json(question ? { question } : { done: true });
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    console.error("POST /api/quiz/next failed:", message);
-    return Response.json({ error: message }, { status: 500 });
+    console.error("POST /api/quiz/next failed:", error instanceof Error ? error.message : String(error));
+    return Response.json({ error: "Something went wrong. Please try again." }, { status: 500 });
   }
 }

@@ -78,6 +78,18 @@ export default function MethodsPage() {
     void load();
   };
 
+  const announce = (text: string) => setNotice((prev) => ({ n: (prev?.n ?? 0) + 1, text }));
+
+  /** Re-read the sheet without touching the loading or error states; whatever is on screen stays if it fails. */
+  const refresh = async () => {
+    try {
+      const data = await api<{ lines: MethodLine[] }>("/api/method-lines");
+      setLines(data.lines);
+    } catch {
+      // keep the current view
+    }
+  };
+
   const decide = async (line: MethodLine, action: Action) => {
     setBusy((b) => ({ ...b, [line.id]: action }));
     setProblems(({ [line.id]: _cleared, ...rest }) => rest);
@@ -87,15 +99,24 @@ export default function MethodsPage() {
           method: "POST",
         });
         setLines((all) => all.map((l) => (l.id === approved.id ? approved : l)));
-        setNotice((prev) => ({ n: (prev?.n ?? 0) + 1, text: `Approved. This line is now on your sheet and in the quiz: ${line.trigger}` }));
+        announce(`Approved. This line is now on your sheet and in the quiz: ${line.trigger}`);
       } else {
         await api<{ ok: true }>(`/api/method-lines/${line.id}/reject`, { method: "POST" });
         setLines((all) => all.filter((l) => l.id !== line.id));
-        setNotice((prev) => ({ n: (prev?.n ?? 0) + 1, text: `Rejected. This line is off your sheet: ${line.trigger}` }));
+        announce(`Rejected. This line is off your sheet: ${line.trigger}`);
       }
     } catch (e) {
-      const message = e instanceof ApiError && e.status === 409 ? `Already on your sheet. ${e.message}` : errorText(e);
-      setProblems((p) => ({ ...p, [line.id]: message }));
+      const status = e instanceof ApiError ? e.status : 0;
+      const message = errorText(e);
+      if (status === 409 && message.startsWith("Duplicate of:")) {
+        setProblems((p) => ({ ...p, [line.id]: `Already on your sheet. ${message}` }));
+      } else if (status === 404 || status === 409) {
+        // The line was already decided (or removed) somewhere else: show the latest sheet, not a dead card.
+        announce(`This line was already decided or removed, so the sheet was refreshed: ${line.trigger}`);
+        await refresh();
+      } else {
+        setProblems((p) => ({ ...p, [line.id]: message }));
+      }
     } finally {
       setBusy(({ [line.id]: _done, ...rest }) => rest);
     }
