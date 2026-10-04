@@ -33,6 +33,7 @@ pnpm-debug.log*
 .vercel/
 
 # OS / editor
+.vscode/
 .DS_Store
 Thumbs.db
 *.log
