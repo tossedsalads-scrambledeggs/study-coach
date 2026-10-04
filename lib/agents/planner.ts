@@ -5,15 +5,20 @@ import { llmJSON, MODELS } from "@/lib/llm";
 import { addDays } from "@/lib/rules";
 
 /**
- * Planner agent: syllabus text and/or a course website -> a CoursePlan (units, weeks, hours, difficulty).
- * One model call; the model's JSON is lenient and every invariant is enforced in code afterwards.
- * Never touches the database.
+ * Planner agent: syllabus text and/or a course website or name (read with Exa) -> a CoursePlan (units, weeks,
+ * hours, difficulty). One model call; the model's JSON is lenient and every invariant is enforced in code
+ * afterwards. Never touches the database.
  */
 
 const MAX_MATERIAL_CHARS = 100_000;
 const DEFAULT_WEEKLY_HOURS = 6;
 const DEFAULT_DIFFICULTY = 3;
 const DEFAULT_DIFFICULTY_REASON = "Difficulty estimated from the topics and workload.";
+
+/** An error whose message is written for the student; routes may show it as is. Any other error becomes a generic message. */
+function userError(message: string): Error {
+  return Object.assign(new Error(message), { userFacing: true });
+}
 
 // ---------------------------------------------------------------------------
 // What we ask the model for (mirrors CoursePlan, but forgiving about types)
@@ -22,9 +27,15 @@ const DEFAULT_DIFFICULTY_REASON = "Difficulty estimated from the topics and work
 const looseNumber = z.union([z.number(), z.string()]).nullish();
 const looseText = z.union([z.string(), z.array(z.string())]).nullish();
 
+/** A deadline as the model writes it: a short name and the due date as the material states it. A plain string is accepted too. */
+const deadlineItem = z.object({ name: z.string().nullish(), due: z.string().nullish() });
+const looseDeadlines = z.union([z.string(), z.array(z.union([z.string(), deadlineItem]))]).nullish();
+
 const unitSchema = z.object({
   number: looseNumber,
   title: z.string().nullish(),
+  /** The unit's release / start date copied exactly as the material writes it ("Thur. Sep 10"). */
+  released: z.string().nullish(),
   startDate: z.string().nullish(),
   endDate: z.string().nullish(),
   lectures: looseText,
@@ -40,7 +51,7 @@ const weekSchema = z.object({
   unitNumber: looseNumber,
   lectures: looseText,
   topics: looseText,
-  deadlines: looseText,
+  deadlines: looseDeadlines,
   studyHours: looseNumber,
 });
 
@@ -57,25 +68,29 @@ const planSchema = z.object({
 
 type RawPlan = z.infer<typeof planSchema>;
 
-const SYSTEM = `You are the planner inside a study coach app. You read a course syllabus and/or the text of a course website and lay the whole course out week by week, from the first class to the last, so a student knows what to study and when.
+const SYSTEM = `You are the planner inside a study coach app. You read a course syllabus and/or the text of course web pages and lay the whole course out week by week, from the first class to the last, so a student knows what to study and when.
 
 Return one JSON object with exactly this shape:
 {
   "course": {"title": string},
-  "units": [{"number": 1, "title": string, "lectures": "Lec 1-4" or null, "topics": string or null, "difficulty": integer 1-5, "difficultyReason": string}],
-  "weeks": [{"startDate": "YYYY-MM-DD", "unitNumber": integer or null, "lectures": string or null, "topics": string or null, "deadlines": string or null, "studyHours": number}]
+  "units": [{"number": 1, "title": string, "released": string or null, "lectures": "Lec 1-4" or null, "topics": string or null, "difficulty": integer 1-5, "difficultyReason": string}],
+  "weeks": [{"startDate": "YYYY-MM-DD", "unitNumber": integer or null, "lectures": string or null, "topics": string or null, "deadlines": [{"name": string, "due": string}] or null, "studyHours": number}]
 }
 
 Rules:
 - Units are the course's major blocks of material, in teaching order, numbered 1, 2, 3 and so on. Use the course's own unit, module or chapter grouping when it has one; otherwise group related weeks into 3 to 8 units. Every unit has a short title.
+- released: when the material gives a date for when a unit is released, opens or starts (for example "Unit 3: Counting (released Thur. Sep 10)"), copy that date exactly as the material writes it ("Thur. Sep 10"). Do not convert, compute or guess it; if it gives a range, copy the first date. Use null only when the material states no date for that unit. Units can share a date. Never space units out evenly when the material gives their dates.
 - weeks lists every week in order, from the first week of class through the last, one entry per week with no gaps. Include exam and review weeks. A holiday or break week keeps its place: unitNumber null, topics "Break", studyHours 0. A week's startDate is the first day of that week (a Monday unless the material says otherwise).
-- Every week names its unit (unitNumber), the lectures held that week (for example "Lec 5-6"), the topics covered, and the deadlines due that week: problem sets, quizzes, projects and exams (say "Midterm" or "Final" explicitly). Use null for a field the material does not give. Do not invent lecture numbers or deadlines the material does not support, but keep the plan complete.
+- unitNumber is the unit being studied that week. A deadline for an earlier unit does not change it.
+- Every week names the lectures held that week (for example "Lec 5-6") and the topics covered. Use null for a field the material does not give. Do not invent lecture numbers or deadlines the material does not support, but keep the plan complete.
+- deadlines has one entry for each problem set, quiz, project or exam due that week. name is short ("PS 1", "Quiz 2", "Exam 1"). due is the exact due date the material gives, with the weekday, month and day ("Wednesday September 9"); never leave the date out and never give only the weekday. Put each deadline in the week whose dates contain its due date. Use null when nothing is due that week.
 - studyHours is the number of hours you recommend the student study that week (reading, problem sets, review), typically 4 to 12, more in a week with a problem set or an exam due.
 - difficulty is 1 (easy) to 5 (hard) for a typical student. difficultyReason is ONE short sentence saying why (for example "Heavy algebra and the first proofs."). Judge it from how abstract the topics are, how much they build on earlier units, and the workload.
-- Dates are ISO calendar dates (YYYY-MM-DD). If the material gives dates without a year, choose the year that puts the course closest to today. If it gives no dates at all, start week 1 on the first Monday on or after today.
+- startDate is an ISO calendar date (YYYY-MM-DD). If the material gives dates without a year, choose the year that puts the course closest to today. If it gives no dates at all, start week 1 on the first Monday on or after today.
+- Write maths as plain text (for example P(A ∩ B), 1/2^n), never LaTeX.
 - Course title: use the title the student gave if there is one, otherwise the course's own title.
-- Be concise: topics and deadlines under 12 words each. Answer directly, without long deliberation.
-- Use only the material you are given. If it is thin, still produce the most complete plan it supports. Course website text can include extra pages from the same site, each marked "=== url ==="; use the ones that belong to this course and ignore pages about other courses.`;
+- Be concise: topics under 12 words. Answer directly, without long deliberation.
+- Use only the material you are given. If it is thin, still produce the most complete plan it supports. Course pages can include several pages from the same site, each marked "=== url ==="; use the ones that belong to this course and ignore pages about other courses.`;
 
 // ---------------------------------------------------------------------------
 // Normalising helpers (plain code, so they also run on whatever llmJSON hands back)
@@ -88,6 +103,10 @@ function validYMD(y: number, m: number, d: number): boolean {
   return date.getUTCFullYear() === y && date.getUTCMonth() === m - 1 && date.getUTCDate() === d;
 }
 
+function ymd(y: number, m: number, d: number): ISODate | null {
+  return validYMD(y, m, d) ? `${y}-${pad(m)}-${pad(d)}` : null;
+}
+
 /** Any reasonable date value -> "YYYY-MM-DD", or null when it is not a real date. */
 function toISODate(value: unknown): ISODate | null {
   if (value instanceof Date) {
@@ -96,10 +115,7 @@ function toISODate(value: unknown): ISODate | null {
   if (typeof value !== "string") return null;
   const s = value.trim();
   const iso = s.match(/^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})(?!\d)/);
-  if (iso) {
-    const [y, m, d] = [Number(iso[1]), Number(iso[2]), Number(iso[3])];
-    return validYMD(y, m, d) ? `${y}-${pad(m)}-${pad(d)}` : null;
-  }
+  if (iso) return ymd(Number(iso[1]), Number(iso[2]), Number(iso[3]));
   // "September 3, 2026" and friends; only when a year is present, so "Sep 3" never gets a guessed year.
   if (/\b(19|20)\d{2}\b/.test(s)) {
     const t = Date.parse(s);
@@ -152,13 +168,148 @@ function text(value: unknown): string | null {
   return s ? s : null;
 }
 
+// ---------------------------------------------------------------------------
+// Dates the material states in its own words ("Thur. Sep 10", "Wednesday September 9")
+// ---------------------------------------------------------------------------
+
+const MONTHS: Record<string, number> = {
+  jan: 1,
+  feb: 2,
+  mar: 3,
+  apr: 4,
+  may: 5,
+  jun: 6,
+  jul: 7,
+  aug: 8,
+  sep: 9,
+  oct: 10,
+  nov: 11,
+  dec: 12,
+};
+const MONTH =
+  "(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)";
+const MONTH_THEN_DAY = new RegExp(`\\b${MONTH}\\.?\\s*(\\d{1,2})(?:st|nd|rd|th)?\\b(?:\\s*,?\\s*(\\d{4}))?`, "i");
+const DAY_THEN_MONTH = new RegExp(`\\b(\\d{1,2})(?:st|nd|rd|th)?\\s+(?:of\\s+)?${MONTH}\\b(?:\\s*,?\\s*(\\d{4}))?`, "i");
+const WEEKDAY = /\b(sun|mon|tue|wed|thu|fri|sat)[a-z]*\b/i;
+const DAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/** Where the course sits in time: used to pick the year for a date written without one. */
+type DateContext = { window: { start: ISODate; end: ISODate } | null; year: number };
+
+const weekdayOf = (iso: ISODate) => new Date(`${iso}T00:00:00Z`).getUTCDay();
+const dayGap = (a: ISODate, b: ISODate) => Math.round((Date.parse(`${a}T00:00:00Z`) - Date.parse(`${b}T00:00:00Z`)) / 86_400_000);
+
+function distanceToWindow(iso: ISODate, window: { start: ISODate; end: ISODate }): number {
+  if (iso < window.start) return dayGap(window.start, iso);
+  if (iso > window.end) return dayGap(iso, window.end);
+  return 0;
+}
+
+/** "Wed Sep 9" */
+function shortDate(iso: ISODate): string {
+  const d = new Date(`${iso}T00:00:00Z`);
+  return `${DAY_NAMES[d.getUTCDay()]} ${MONTH_NAMES[d.getUTCMonth()]} ${d.getUTCDate()}`;
+}
+
+function readMonthDay(s: string): { month: number; day: number; year: number | null } | null {
+  const iso = s.match(/(\d{4})-(\d{1,2})-(\d{1,2})/);
+  if (iso) return { year: Number(iso[1]), month: Number(iso[2]), day: Number(iso[3]) };
+  const monthFirst = s.match(MONTH_THEN_DAY);
+  if (monthFirst) {
+    return {
+      month: MONTHS[monthFirst[1].slice(0, 3).toLowerCase()],
+      day: Number(monthFirst[2]),
+      year: monthFirst[3] ? Number(monthFirst[3]) : null,
+    };
+  }
+  const dayFirst = s.match(DAY_THEN_MONTH);
+  if (dayFirst) {
+    return {
+      month: MONTHS[dayFirst[2].slice(0, 3).toLowerCase()],
+      day: Number(dayFirst[1]),
+      year: dayFirst[3] ? Number(dayFirst[3]) : null,
+    };
+  }
+  const numeric = s.match(/\b(\d{1,2})\/(\d{1,2})(?:\/(\d{2,4}))?\b/);
+  if (numeric) {
+    const year = numeric[3] ? (numeric[3].length === 2 ? 2000 + Number(numeric[3]) : Number(numeric[3])) : null;
+    return { month: Number(numeric[1]), day: Number(numeric[2]), year };
+  }
+  return null;
+}
+
+/**
+ * A date as the material writes it -> "YYYY-MM-DD". Without a year, the year is the one that puts the date
+ * inside (or closest to) the course's weeks; a weekday in the text ("Thur. Sep 10") settles it when it can.
+ */
+function parseStatedDate(value: unknown, ctx: DateContext): ISODate | null {
+  if (typeof value !== "string") return null;
+  const s = value.trim();
+  const found = s ? readMonthDay(s) : null;
+  if (!found) return null;
+
+  const weekdayWord = s.match(WEEKDAY)?.[1].toLowerCase();
+  const weekday = weekdayWord ? DAY_NAMES.findIndex((d) => d.toLowerCase() === weekdayWord) : -1;
+
+  const base = ctx.window ? Number(ctx.window.start.slice(0, 4)) : ctx.year;
+  const last = ctx.window ? Number(ctx.window.end.slice(0, 4)) : ctx.year;
+  const years = found.year != null ? [found.year] : [...new Set([base, last, base + 1, base - 1])];
+
+  let options = years.map((y) => ymd(y, found.month, found.day)).filter((d): d is ISODate => d != null);
+  if (weekday >= 0) {
+    const sameWeekday = options.filter((d) => weekdayOf(d) === weekday);
+    if (sameWeekday.length > 0) options = sameWeekday;
+  }
+  if (options.length === 0) return null;
+  const window = ctx.window;
+  if (window && options.length > 1) {
+    options = [...options].sort((a, b) => distanceToWindow(a, window) - distanceToWindow(b, window));
+  }
+  return options[0];
+}
+
+/** The day inside the week starting on `weekStart` that falls on `weekday` (0 = Sunday). */
+function dayInWeek(weekStart: ISODate, weekday: number): ISODate {
+  return addDays(weekStart, (weekday - weekdayOf(weekStart) + 7) % 7);
+}
+
+/** "PS 1 due Wed Sep 9; Exam 1 due Wed Oct 7". A weekday with no date resolves inside the week it was filed under. */
+function formatDeadlines(value: unknown, ctx: DateContext, weekStart: ISODate): string | null {
+  if (typeof value === "string") return text(value);
+  if (!Array.isArray(value)) return null;
+  const parts: string[] = [];
+  for (const item of value) {
+    if (typeof item === "string") {
+      const line = text(item);
+      if (line) parts.push(line);
+      continue;
+    }
+    const entry = item as { name?: unknown; due?: unknown } | null;
+    const name = text(entry?.name);
+    const due = text(entry?.due);
+    let when = due;
+    if (due) {
+      const stated = parseStatedDate(due, ctx);
+      const weekdayWord = due.match(WEEKDAY)?.[1].toLowerCase();
+      const weekday = weekdayWord ? DAY_NAMES.findIndex((d) => d.toLowerCase() === weekdayWord) : -1;
+      if (stated) when = shortDate(stated);
+      else if (weekday >= 0) when = shortDate(dayInWeek(weekStart, weekday));
+    }
+    if (name && when) parts.push(`${name} due ${when}`);
+    else if (name) parts.push(name);
+    else if (when) parts.push(`Due ${when}`);
+  }
+  return parts.length > 0 ? parts.join("; ") : null;
+}
+
 function normalizePlan(
   raw: RawPlan,
-  input: { title?: string; courseUrl?: string; today: ISODate },
+  input: { title?: string; sourceUrl: string | null; today: ISODate },
 ): CoursePlan {
   const rawUnits = Array.isArray(raw?.units) ? raw.units : [];
   if (rawUnits.length === 0) {
-    throw new Error("The course material did not contain anything to plan. Try pasting the syllabus text.");
+    throw userError("The course material did not contain anything to plan. Try pasting the syllabus text.");
   }
   const rawWeeks = Array.isArray(raw?.weeks) ? raw.weeks : [];
 
@@ -183,25 +334,63 @@ function normalizePlan(
       unitNumber: oldUnit != null ? (renumber.get(oldUnit) ?? null) : null,
       lectures: text(w?.lectures),
       topics: text(w?.topics),
-      deadlines: text(w?.deadlines),
+      deadlines: null,
       studyHours: nonNegativeHours(w?.studyHours),
     });
+  });
+
+  // Where the course sits in time, to give a year to dates the material writes without one.
+  const weekStarts = weeks.map((w) => w.startDate).sort();
+  const courseStart = toISODate(raw?.course?.startDate);
+  const courseEnd = toISODate(raw?.course?.endDate);
+  const window =
+    weekStarts.length > 0
+      ? { start: weekStarts[0], end: addDays(weekStarts[weekStarts.length - 1], 6) }
+      : courseStart && courseEnd
+        ? { start: courseStart, end: courseEnd }
+        : null;
+  const ctx: DateContext = { window, year: Number(input.today.slice(0, 4)) };
+
+  // Deadlines carry the exact date the material gives.
+  rawWeeks.forEach((w, i) => {
+    weeks[i].deadlines = formatDeadlines(w?.deadlines, ctx, weeks[i].startDate);
+  });
+
+  // Unit start dates: the release date the material states wins; only then a date from the model, then the unit's first week.
+  const stated = rawUnits.map((u) => parseStatedDate(u?.released, ctx));
+  const starts = rawUnits.map((u, i) => {
+    const own = weeks.filter((w) => w.unitNumber === i + 1).map((w) => w.startDate).sort();
+    return stated[i] ?? toISODate(u?.startDate) ?? own[0] ?? null;
   });
 
   const units: Unit[] = rawUnits.map((u, i) => {
     const number = i + 1;
     const own = weeks.filter((w) => w.unitNumber === number);
-    const starts = own.map((w) => w.startDate).sort();
+    const ownStarts = own.map((w) => w.startDate).sort();
     const weekHours = own.reduce((sum, w) => sum + (w.studyHours ?? 0), 0);
     const estHours =
       positiveHours(u?.estHours) ??
       positiveHours(weekHours) ??
       round1(Math.max(1, own.length) * DEFAULT_WEEKLY_HOURS);
+
+    const startDate = starts[i];
+    let endDate = toISODate(u?.endDate);
+    if (!endDate) {
+      if (stated[i] != null) {
+        // A stated release runs until the next later release (units can share a date), or the end of the course.
+        const later = starts.filter((s, j) => j > i && s != null && startDate != null && s > startDate).sort();
+        endDate = later.length > 0 ? addDays(later[0] as ISODate, -1) : (window?.end ?? null);
+      } else if (ownStarts.length > 0) {
+        endDate = addDays(ownStarts[ownStarts.length - 1], 6);
+      }
+    }
+    if (startDate && endDate && endDate < startDate) endDate = startDate;
+
     return {
       number,
       title: text(u?.title) ?? `Unit ${number}`,
-      startDate: toISODate(u?.startDate) ?? starts[0] ?? null,
-      endDate: toISODate(u?.endDate) ?? (starts.length > 0 ? addDays(starts[starts.length - 1], 6) : null),
+      startDate,
+      endDate,
       lectures: text(u?.lectures),
       topics: text(u?.topics),
       estHours,
@@ -210,31 +399,18 @@ function normalizePlan(
     };
   });
 
-  const firstWeek = weeks[0]?.startDate ?? null;
-  const lastWeek = weeks[weeks.length - 1]?.startDate ?? null;
+  const firstWeek = weekStarts[0] ?? null;
+  const lastWeek = weekStarts[weekStarts.length - 1] ?? null;
   return {
     course: {
       title: input.title?.trim() || text(raw?.course?.title) || "My course",
-      sourceUrl: input.courseUrl?.trim() || null,
-      startDate: toISODate(raw?.course?.startDate) ?? firstWeek,
-      endDate: toISODate(raw?.course?.endDate) ?? (lastWeek ? addDays(lastWeek, 6) : null),
+      sourceUrl: input.sourceUrl,
+      startDate: courseStart ?? firstWeek,
+      endDate: courseEnd ?? (lastWeek ? addDays(lastWeek, 6) : null),
     },
     units,
     weeks,
   };
-}
-
-/**
- * One model call with the smart model. The AI Gateway answers 504 when a model takes over a minute, so on
- * that error (and only that one) ask once more with the fast model, which finishes in a fraction of the time.
- */
-async function askModel(args: { system: string; user: string; schema: z.ZodType<RawPlan> }): Promise<RawPlan> {
-  try {
-    return await llmJSON({ ...args, model: MODELS.smart });
-  } catch (err) {
-    if (!/AI Gateway 504|took too long/i.test(err instanceof Error ? err.message : String(err))) throw err;
-    return await llmJSON({ ...args, model: MODELS.fast });
-  }
 }
 
 function weekday(date: ISODate): string {
@@ -242,6 +418,11 @@ function weekday(date: ISODate): string {
   return Number.isNaN(d.getTime())
     ? ""
     : new Intl.DateTimeFormat("en-US", { weekday: "long", timeZone: "UTC" }).format(d);
+}
+
+/** The page Exa read first (every page in the text starts with "=== url ==="): the course's primary source. */
+function firstSourceUrl(siteText: string): string | null {
+  return siteText.match(/^=== (\S+) ===$/m)?.[1] ?? null;
 }
 
 // ---------------------------------------------------------------------------
@@ -252,25 +433,26 @@ export const planCourse: PlanCourse = async (input) => {
   const syllabusText = input.syllabusText?.trim() ?? "";
   const courseUrl = input.courseUrl?.trim() ?? "";
   if (!syllabusText && !courseUrl) {
-    throw new Error("Give the planner a syllabus or a course URL.");
+    throw userError("Give the planner a syllabus, a course website or a course name.");
   }
 
+  // courseUrl is a course website or a course name; Exa reads the page or searches for the syllabus.
   let siteText = "";
   if (courseUrl) {
     try {
       siteText = ((await fetchCourseText(courseUrl)) ?? "").trim();
     } catch (err) {
-      // A pasted syllabus is enough to plan from; with only a URL the failure is the answer.
+      // A pasted syllabus is enough to plan from; with only a URL or name the failure is the answer.
       if (!syllabusText) throw err;
     }
   }
 
   const sections: string[] = [];
   if (syllabusText) sections.push(`SYLLABUS (pasted by the student):\n${syllabusText}`);
-  if (siteText) sections.push(`COURSE WEBSITE (${courseUrl}):\n${siteText}`);
+  if (siteText) sections.push(`COURSE PAGES (read with Exa for "${courseUrl}"):\n${siteText}`);
   const material = sections.join("\n\n").slice(0, MAX_MATERIAL_CHARS);
   if (!material) {
-    throw new Error(`Could not read any text from ${courseUrl}. Paste the syllabus text instead.`);
+    throw userError(`Could not read any text from ${courseUrl}. Paste the syllabus text instead.`);
   }
 
   const day = weekday(input.today);
@@ -278,6 +460,6 @@ export const planCourse: PlanCourse = async (input) => {
   if (input.title?.trim()) header.push(`The student calls this course: "${input.title.trim()}".`);
   const user = [...header, "", "COURSE MATERIAL", "<<<", material, ">>>"].join("\n");
 
-  const raw = await askModel({ system: SYSTEM, user, schema: planSchema });
-  return normalizePlan(raw, { title: input.title, courseUrl, today: input.today });
+  const raw = await llmJSON({ system: SYSTEM, user, schema: planSchema, model: MODELS.smart });
+  return normalizePlan(raw, { title: input.title, sourceUrl: firstSourceUrl(siteText), today: input.today });
 };

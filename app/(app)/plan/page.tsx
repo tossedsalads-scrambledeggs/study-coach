@@ -56,8 +56,13 @@ function hours(value: number | null | undefined): string {
   return value == null ? "—" : String(Math.round(value * 10) / 10);
 }
 
-function withScheme(url: string): string {
-  return /^[a-z][a-z0-9+.-]*:\/\//i.test(url) ? url : `https://${url}`;
+/** "mit.edu" from "https://www.mit.edu/x"; the text itself when it is not a URL. */
+function hostOf(url: string): string {
+  try {
+    return new URL(url).hostname.replace(/^www\./i, "");
+  } catch {
+    return url;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -69,25 +74,20 @@ async function readError(res: Response): Promise<string> {
   return typeof data?.error === "string" && data.error ? data.error : `Something went wrong (${res.status}).`;
 }
 
-/** Turn a thrown value into a message a student can act on (network drops, slow or busy AI model). */
+/** Turn a thrown value into a message a student can act on. */
 function networkError(err: unknown): Error {
   if (err instanceof TypeError) return new Error("Could not reach the server. Check your connection and try again.");
-  const message = err instanceof Error ? err.message : String(err);
-  if (/AI Gateway 504|took too long/i.test(message)) {
-    return new Error("The AI model took too long to answer. Try again; a shorter syllabus can help.");
-  }
-  if (/AI Gateway 429/i.test(message)) {
-    return new Error("The AI model is busy right now. Wait a minute and try again.");
-  }
-  return err instanceof Error ? err : new Error(message);
+  return err instanceof Error ? err : new Error(String(err));
 }
 
-async function fetchCurrent(): Promise<CourseView | null> {
+/** The current course (null when there is none) and whether the demo is locked to the student's course. */
+async function fetchCurrent(): Promise<{ view: CourseView | null; locked: boolean }> {
   try {
     const res = await fetch("/api/courses/current", { cache: "no-store" });
-    if (res.status === 404) return null;
+    const locked = res.headers.get("x-demo-locked") === "1";
+    if (res.status === 404) return { view: null, locked };
     if (!res.ok) throw new Error(await readError(res));
-    return (await res.json()) as CourseView;
+    return { view: (await res.json()) as CourseView, locked };
   } catch (err) {
     throw networkError(err);
   }
@@ -189,7 +189,7 @@ function PlanForm({
     const courseUrl = url.trim();
     const syllabusText = syllabus.trim();
     if (!courseUrl && !syllabusText) {
-      setError("Add the course website or paste the syllabus, so there is something to plan from.");
+      setError("Add a course website or name, or paste the syllabus, so there is something to plan from.");
       return;
     }
     setBusy(true);
@@ -200,7 +200,7 @@ function PlanForm({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           title: title.trim() || undefined,
-          courseUrl: courseUrl ? withScheme(courseUrl) : undefined,
+          courseUrl: courseUrl || undefined,
           syllabusText: syllabusText || undefined,
         }),
       });
@@ -221,36 +221,21 @@ function PlanForm({
       aria-busy={busy}
     >
       <div className="space-y-1.5">
-        <label htmlFor="plan-title" className={fieldLabel}>
-          Course name <span className="font-normal text-muted-foreground">(optional)</span>
-        </label>
-        <Input
-          id="plan-title"
-          value={title}
-          onChange={(e) => setTitle(e.target.value)}
-          placeholder="Probability, Stat 110"
-          autoComplete="off"
-          disabled={busy}
-        />
-        <p className={helpText}>Leave it blank and the coach uses the name it finds in the material.</p>
-      </div>
-
-      <div className="space-y-1.5">
         <label htmlFor="plan-url" className={fieldLabel}>
-          Course website
+          Course website or name
         </label>
         <Input
           id="plan-url"
-          type="url"
-          inputMode="url"
           value={url}
           onChange={(e) => setUrl(e.target.value)}
-          placeholder="https://stat110.hsites.harvard.edu"
+          placeholder="https://stat110.hsites.harvard.edu or MIT 6.431x Probability"
           autoComplete="off"
           spellCheck={false}
           disabled={busy}
         />
-        <p className={helpText}>The coach reads the page and looks for the syllabus and schedule on the same site.</p>
+        <p className={helpText}>
+          Exa reads the page and finds the syllabus and schedule. Give a course name and Exa searches the web for it.
+        </p>
       </div>
 
       <div className="space-y-1.5">
@@ -267,6 +252,21 @@ function PlanForm({
           disabled={busy}
         />
         <p className={helpText}>Use either one, or both. Text copied from a PDF works too.</p>
+      </div>
+
+      <div className="space-y-1.5">
+        <label htmlFor="plan-title" className={fieldLabel}>
+          Plan title <span className="font-normal text-muted-foreground">(optional)</span>
+        </label>
+        <Input
+          id="plan-title"
+          value={title}
+          onChange={(e) => setTitle(e.target.value)}
+          placeholder="Probability, Stat 110"
+          autoComplete="off"
+          disabled={busy}
+        />
+        <p className={helpText}>Leave it blank and the coach uses the course's own title.</p>
       </div>
 
       {error ? <ErrorNotice message={error} /> : null}
@@ -525,12 +525,32 @@ function WeeklyBreakdown({ weeks, currentUnit }: { weeks: Week[]; currentUnit: n
   );
 }
 
+/** Shown when Exa read the course: the primary page it read, as a link. */
+function ExaChip({ url }: { url: string }) {
+  return (
+    <a
+      href={url}
+      target="_blank"
+      rel="noreferrer"
+      title={url}
+      className="inline-flex max-w-full items-center gap-1.5 rounded-full border bg-muted/50 px-2.5 py-0.5 text-xs font-medium text-foreground outline-none transition-colors hover:bg-muted focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+    >
+      <span className="text-muted-foreground">Read with Exa:</span>
+      <span className="truncate">{hostOf(url)}</span>
+      <ExternalLink className="size-3 shrink-0" aria-hidden="true" />
+      <span className="sr-only">(opens in a new tab)</span>
+    </a>
+  );
+}
+
 function PlanView({
   view,
+  locked,
   onChanged,
   onReplace,
 }: {
   view: CourseView;
+  locked: boolean;
   onChanged: () => Promise<void>;
   onReplace: () => void;
 }) {
@@ -539,9 +559,9 @@ function PlanView({
   return (
     <div className="space-y-8">
       <div className="flex flex-wrap items-start justify-between gap-4">
-        <div className="min-w-0 space-y-1">
+        <div className="min-w-0 space-y-1.5">
           <h2 className="text-balance text-xl font-semibold tracking-tight">{course.title}</h2>
-          <p className="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm text-muted-foreground">
+          <p className="flex flex-wrap items-center gap-x-3 gap-y-1.5 text-sm text-muted-foreground">
             <span className="inline-flex items-center gap-1.5">
               <CalendarDays className="size-4" aria-hidden="true" />
               <span className="tabular-nums">
@@ -551,24 +571,17 @@ function PlanView({
             <span className="tabular-nums">
               {weeks.length} weeks, {units.length} units, about {hours(totalHours)} study hours
             </span>
-            {course.sourceUrl ? (
-              <a
-                href={course.sourceUrl}
-                target="_blank"
-                rel="noreferrer"
-                className="inline-flex items-center gap-1 underline-offset-4 hover:underline"
-              >
-                Course website
-                <ExternalLink className="size-3.5" aria-hidden="true" />
-                <span className="sr-only">(opens in a new tab)</span>
-              </a>
-            ) : null}
+            {course.sourceUrl ? <ExaChip url={course.sourceUrl} /> : null}
           </p>
         </div>
-        <Button type="button" variant="outline" onClick={onReplace}>
-          New plan
-        </Button>
+        {locked ? null : (
+          <Button type="button" variant="outline" onClick={onReplace}>
+            New plan
+          </Button>
+        )}
       </div>
+
+      {locked ? <p className={helpText}>This demo is locked to the student&apos;s course, so the plan is read-only.</p> : null}
 
       <CurrentUnitPicker view={view} onChanged={onChanged} />
       <UnitSummary units={units} currentUnit={view.currentUnit} />
@@ -584,7 +597,7 @@ function PlanView({
 type LoadState =
   | { status: "loading" }
   | { status: "error"; message: string }
-  | { status: "ready"; view: CourseView | null };
+  | { status: "ready"; view: CourseView | null; locked: boolean };
 
 export default function PlanPage() {
   const [state, setState] = useState<LoadState>({ status: "loading" });
@@ -592,7 +605,8 @@ export default function PlanPage() {
 
   const load = useCallback(async () => {
     try {
-      setState({ status: "ready", view: await fetchCurrent() });
+      const { view, locked } = await fetchCurrent();
+      setState({ status: "ready", view, locked });
     } catch (err) {
       setState({ status: "error", message: err instanceof Error ? err.message : String(err) });
     }
@@ -614,6 +628,7 @@ export default function PlanPage() {
   };
 
   const view = state.status === "ready" ? state.view : null;
+  const locked = state.status === "ready" && state.locked;
 
   return (
     <div className="mx-auto w-full max-w-6xl space-y-8 px-4 py-8 sm:px-6">
@@ -629,25 +644,33 @@ export default function PlanPage() {
       {state.status === "error" ? <ErrorNotice message={state.message} onRetry={retry} /> : null}
 
       {state.status === "ready" && !view ? (
-        <div className="max-w-2xl space-y-4">
-          <div className="space-y-1">
-            <h2 className="text-balance text-lg font-semibold tracking-tight">No study plan yet</h2>
-            <p className="text-muted-foreground">
-              Give the coach your course website or paste the syllabus. It builds the plan and a first method sheet.
-            </p>
+        locked ? (
+          <div className="max-w-2xl space-y-1">
+            <h2 className="text-balance text-lg font-semibold tracking-tight">No study plan to show</h2>
+            <p className="text-muted-foreground">This demo is locked to the student&apos;s course, so a new plan cannot be built here.</p>
           </div>
-          <PlanForm hasPlan={false} onCreated={created} />
-        </div>
+        ) : (
+          <div className="max-w-2xl space-y-4">
+            <div className="space-y-1">
+              <h2 className="text-balance text-lg font-semibold tracking-tight">No study plan yet</h2>
+              <p className="text-muted-foreground">
+                Give the coach a course website or name, or paste the syllabus. It builds the plan and a first method
+                sheet.
+              </p>
+            </div>
+            <PlanForm hasPlan={false} onCreated={created} />
+          </div>
+        )
       ) : null}
 
       {state.status === "ready" && view ? (
-        replacing ? (
+        replacing && !locked ? (
           <div className="max-w-2xl space-y-4">
             <h2 className="text-balance text-lg font-semibold tracking-tight">Build a new plan</h2>
             <PlanForm hasPlan onCreated={created} onCancel={() => setReplacing(false)} />
           </div>
         ) : (
-          <PlanView view={view} onChanged={load} onReplace={() => setReplacing(true)} />
+          <PlanView view={view} locked={locked} onChanged={load} onReplace={() => setReplacing(true)} />
         )
       ) : null}
     </div>

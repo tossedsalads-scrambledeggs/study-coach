@@ -40,6 +40,7 @@ Lines are generic to the situation: never about one specific problem, number or 
 
 Write 2 or 3 lines for EVERY unit (4 only for a clearly harder unit), each covering a different situation, grounded in the unit's lectures and topics. Keep the whole sheet under 24 lines: with many units, write 2 per unit. Adapt to the subject: for a programming course, situations in code or a spec; for a proof course, situations in a statement to prove.
 Keep every field short, under 20 words, and write nothing outside the JSON.
+Write maths as plain text (for example P(A ∩ B), 1/2^n), never LaTeX.
 
 Return one JSON object: {"lines": [{"unitNumber": 4, "trigger": string, "move": string, "trap": string, "source": "U4 Lec 11"}]}. unitNumber must be one of the unit numbers listed below.`;
 
@@ -57,21 +58,6 @@ function oneLine(value: unknown): string | null {
   if (typeof value !== "string") return null;
   const s = value.replace(/\s+/g, " ").trim();
   return s ? s : null;
-}
-
-type Lines = z.infer<typeof linesSchema>;
-
-/**
- * One model call with the smart model. The AI Gateway answers 504 when a model takes over a minute, so on
- * that error (and only that one) ask once more with the fast model, which finishes in a fraction of the time.
- */
-async function askModel(args: { system: string; user: string; schema: z.ZodType<Lines> }): Promise<Lines> {
-  try {
-    return await llmJSON({ ...args, model: MODELS.smart });
-  } catch (err) {
-    if (!/AI Gateway 504|took too long/i.test(err instanceof Error ? err.message : String(err))) throw err;
-    return await llmJSON({ ...args, model: MODELS.fast });
-  }
 }
 
 function lectureFromSource(source: string | null): string | null {
@@ -103,7 +89,7 @@ export const seedMethodLines: SeedMethodLines = async ({ courseTitle, units, mat
       : []),
   ].join("\n");
 
-  const result = await askModel({ system: SYSTEM, user, schema: linesSchema });
+  const result = await llmJSON({ system: SYSTEM, user, schema: linesSchema, model: MODELS.smart });
 
   const byNumber = new Map(units.map((u) => [u.number, u]));
   const perUnit = new Map<number, number>();
