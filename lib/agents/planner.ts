@@ -78,10 +78,11 @@ Return one JSON object with exactly this shape:
 }
 
 Rules:
-- Units are the course's major blocks of material, in teaching order, numbered 1, 2, 3 and so on. Use the course's own unit, module or chapter grouping when it has one; otherwise group related weeks into 3 to 8 units. Every unit has a short title.
+- Units are the course's major blocks of material, in teaching order. Use the course's own unit, module or chapter grouping when it has one, and give each unit's number exactly as the material writes it ("Unit 4: Discrete random variables" has number 4, even if that is not its position in the list). Only when the material has no grouping, group related weeks into 3 to 8 units numbered 1, 2, 3 and so on. Every unit has a short title.
+- Skip overview, orientation and welcome units that have no lectures (for example "Unit 0: Overview"): do not list them as units, and do not count them when you number the others.
 - released: when the material gives a date for when a unit is released, opens or starts (for example "Unit 3: Counting (released Thur. Sep 10)"), copy that date exactly as the material writes it ("Thur. Sep 10"). Do not convert, compute or guess it; if it gives a range, copy the first date. Use null only when the material states no date for that unit. Units can share a date. Never space units out evenly when the material gives their dates.
 - weeks lists every week in order, from the first week of class through the last, one entry per week with no gaps. Include exam and review weeks. A holiday or break week keeps its place: unitNumber null, topics "Break", studyHours 0. A week's startDate is the first day of that week (a Monday unless the material says otherwise).
-- unitNumber is the unit being studied that week. A deadline for an earlier unit does not change it.
+- unitNumber is the number of the unit being studied that week, as listed in units. A deadline for an earlier unit does not change it. A week that only covers a skipped overview unit gets the first listed unit.
 - Every week names the lectures held that week (for example "Lec 5-6") and the topics covered. Use null for a field the material does not give. Do not invent lecture numbers or deadlines the material does not support, but keep the plan complete.
 - deadlines has one entry for each problem set, quiz, project or exam due that week. name is short ("PS 1", "Quiz 2", "Exam 1"). due is the exact due date the material gives, with the weekday, month and day ("Wednesday September 9"); never leave the date out and never give only the weekday. Put each deadline in the week whose dates contain its due date. Use null when nothing is due that week.
 - studyHours is the number of hours you recommend the student study that week (reading, problem sets, review), typically 4 to 12, more in a week with a problem set or an exam due.
@@ -303,11 +304,28 @@ function formatDeadlines(value: unknown, ctx: DateContext, weekStart: ISODate): 
   return parts.length > 0 ? parts.join("; ") : null;
 }
 
+type RawUnit = RawPlan["units"][number];
+
+/** "Overview", "Course overview", "Unit 0: Introduction", "Welcome" and the like: a title with nothing else in it. */
+const OVERVIEW_TITLE =
+  /^(?:unit\s*\d+\s*[:.\-–—]\s*)?(?:course\s+)?(?:overview|introduction|intro|orientation|welcome|getting started|logistics|information|syllabus)\s*$/i;
+
+/** An overview / orientation unit has no lectures to study: unit 0, or a title that is only "Overview" and the like. */
+function isOverviewUnit(u: RawUnit): boolean {
+  if (toNumber(u?.number) === 0) return true;
+  const title = text(u?.title);
+  const lectures = text(u?.lectures);
+  return title != null && OVERVIEW_TITLE.test(title) && !(lectures != null && /\d/.test(lectures));
+}
+
 function normalizePlan(
   raw: RawPlan,
   input: { title?: string; sourceUrl: string | null; today: ISODate },
 ): CoursePlan {
-  const rawUnits = Array.isArray(raw?.units) ? raw.units : [];
+  const allUnits = Array.isArray(raw?.units) ? raw.units : [];
+  // Overview units (Unit 0, "Overview" with no lectures) are not studied: drop them, unless nothing else is left.
+  const studied = allUnits.filter((u) => !isOverviewUnit(u));
+  const rawUnits = studied.length > 0 ? studied : allUnits;
   if (rawUnits.length === 0) {
     throw userError("The course material did not contain anything to plan. Try pasting the syllabus text.");
   }
@@ -319,6 +337,12 @@ function normalizePlan(
     const old = toNumber(u?.number);
     if (old != null && !renumber.has(old)) renumber.set(old, i + 1);
   });
+  // A week that only covered a dropped overview unit belongs to the first real unit.
+  allUnits.forEach((u) => {
+    const old = toNumber(u?.number);
+    if (!rawUnits.includes(u) && old != null && !renumber.has(old)) renumber.set(old, 1);
+  });
+  if (!renumber.has(0)) renumber.set(0, 1);
 
   // Weeks: numbered 1..n in order, ISO start dates (a missing one follows the week before it).
   const weeks: Week[] = [];
