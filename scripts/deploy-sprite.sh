@@ -16,7 +16,8 @@ echo "== code"
 run "if [ -d $APP/.git ]; then cd $APP && git fetch -q origin && git reset -q --hard origin/main; else git clone -q $REPO $APP; fi && cd $APP && git log --oneline -1"
 
 echo "== env (piped in, never printed)"
-"$SPRITE_CLI" exec -s "$SPRITE" -- bash -c "umask 077 && cat > $APP/.env" < .env
+# DEMO_LOCK=1 (default) keeps the public demo on the student's course; DEMO_LOCK=0 deploy-sprite.sh to unlock.
+{ cat .env; printf '\nDEMO_LOCK=%s\n' "${DEMO_LOCK:-1}"; } | "$SPRITE_CLI" exec -s "$SPRITE" -- bash -c "umask 077 && cat > $APP/.env"
 
 echo "== install + build"
 run "cd $APP && npm ci --no-audit --no-fund --loglevel=error && npm run build 2>&1 | tail -15"
