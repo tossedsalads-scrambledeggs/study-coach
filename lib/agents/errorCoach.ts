@@ -52,6 +52,7 @@ Fields
 - correctApproach: the correct solution as numbered steps, one step per line ("1. ...", "2. ..."). Show the reasoning, not just the result, and end with the final answer.
 - lesson: ONE reusable sentence, the fix, that helps on any similar problem. It must not depend on this problem's numbers or names.
 - methodLine: a row for the student's method sheet (Trigger, Move, Trap), described below.
+Write maths as plain text (e.g. P(A ∩ B), 1/2^n, sqrt(x)), never LaTeX or $...$. This applies to every field, including the method line.
 
 Method line
 RULE: a line must be actionable inside a problem, not true-in-general.
@@ -165,6 +166,7 @@ The student passes only if BOTH hold:
 A right number with no sign of the method, or reached by the wrong method, does not pass. A sound method with an arithmetic slip in the result does not pass either; say so kindly. Working does not need to be long, but the key step must be visible or unmistakable from what they wrote.
 
 Feedback is one to three plain sentences, addressed to the student. If they passed, say what they got right. If not, say exactly what is off and what to do next, without handing over the full solution.
+Write maths as plain text (e.g. P(A ∩ B), 1/2^n, sqrt(x)), never LaTeX or $...$.
 
 Respond with exactly this JSON shape:
 { "passed": boolean, "feedback": string }`;

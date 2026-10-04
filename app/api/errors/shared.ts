@@ -15,10 +15,16 @@ export function badRequest(message: string): Response {
   return Response.json({ error: message }, { status: 400 });
 }
 
+const GENERIC_ERROR = "Something went wrong. Please try again.";
+
+/** Deliberate, user-facing service messages. Anything else may carry SQL, hosts or gateway bodies. */
+const USER_FACING_ERRORS = new Set(["No course yet", "Error log entry not found"]);
+
+/** Log the real failure server-side; tell the browser only the generic line (or an allowlisted message). */
 export function serverError(err: unknown): Response {
-  const message = err instanceof Error && err.message ? err.message : "Something went wrong";
-  console.error("[errors api]", message);
-  return Response.json({ error: message }, { status: 500 });
+  const detail = err instanceof Error && err.message ? err.message : "Unknown error";
+  console.error("[errors api]", detail);
+  return Response.json({ error: USER_FACING_ERRORS.has(detail) ? detail : GENERIC_ERROR }, { status: 500 });
 }
 
 /** Read the JSON body and validate it: the data, or a ready-made 400 response. */

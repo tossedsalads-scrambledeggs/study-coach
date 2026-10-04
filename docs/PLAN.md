@@ -132,12 +132,18 @@ No agent calls another. Each reads the board and the repo, and writes only its o
 ## 6. Coding rules
 
 - Never print, log, commit or paste secrets. Read env vars by name only. `.env` stays local.
-- All model calls: `chat`, `llmJSON`, `embed` from `@/lib/llm`. All SQL: `query` from `@/lib/db`.
+- All model calls go through the Neon AI Gateway: `chat`, `llmJSON`, `embed` from `@/lib/llm` (the coach
+  chat streams through the same gateway via `@ai-sdk/openai-compatible`). All SQL: `query` from
+  `@/lib/db`; a multi-statement write runs in one transaction on a client from `db().connect()`
+  (begin / commit / rollback, release in `finally`) so it never leaves data half-written.
   Default to `MODELS.smart` for diagnosis, planning and problem writing; `MODELS.fast` for grading and
   quiz questions.
 - Agents (`lib/agents/*`) take plain inputs and return the contract type; they never touch the DB, so
   tests can mock `@/lib/llm`.
 - Validate request bodies with `zod`; 400 with `{error}` on bad input; 500 with `{error}` on failure.
+  The app is public with no login, so a 500 never returns raw exception text (SQL, hosts, gateway
+  bodies): log it server-side and respond `{error: "Something went wrong. Please try again."}`,
+  passing through only deliberate user-facing messages such as "No course yet".
 - Don't edit `package.json`; packages available: next, react, ai, @ai-sdk/openai-compatible,
   @assistant-ui/react, @assistant-ui/ai-sdk, @assistant-ui/react-markdown, pg, exa-js, agentmail, zod,
   lucide-react, tailwind, vitest.

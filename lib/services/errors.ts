@@ -9,7 +9,7 @@ import type {
   MethodLine,
   NewProblemInput,
 } from "@/lib/contracts";
-import { query } from "@/lib/db";
+import { db, query } from "@/lib/db";
 import { currentUnit, redrillDate, todayISO } from "@/lib/rules";
 
 /**
@@ -185,8 +185,45 @@ function optionalText(value: string | null | undefined): string | null {
   return text ? text : null;
 }
 
-async function insertProblem(courseId: string, input: NewProblemInput): Promise<string> {
-  const rows = await query<{ id: string }>(
+/** A query function tied to one connection, so a group of statements shares one transaction. */
+type Query = <T = Record<string, unknown>>(text: string, params?: unknown[]) => Promise<T[]>;
+
+/**
+ * Run a sequence of writes atomically on one pooled connection: commit when `work` resolves, roll back
+ * when it throws. Keep model calls and plain reads outside, since the connection is held until `work` ends.
+ */
+async function withTransaction<T>(work: (q: Query) => Promise<T>): Promise<T> {
+  const client = await db().connect();
+  let broken: Error | undefined;
+  // The pool does not listen to a client that is checked out, so a dropped connection would otherwise
+  // surface as an unhandled 'error' event and take the process down. Remember it and discard the client.
+  const onError = (err: Error) => {
+    broken = err;
+  };
+  client.on("error", onError);
+  try {
+    await client.query("begin");
+    const q: Query = async <R>(text: string, params: unknown[] = []) =>
+      (await client.query(text, params)).rows as R[];
+    const result = await work(q);
+    await client.query("commit");
+    return result;
+  } catch (err) {
+    try {
+      await client.query("rollback");
+    } catch (rollbackErr) {
+      // Unknown connection state: have the pool discard it rather than hand it out again.
+      broken = rollbackErr instanceof Error ? rollbackErr : new Error(String(rollbackErr));
+    }
+    throw err;
+  } finally {
+    client.removeListener("error", onError);
+    client.release(broken);
+  }
+}
+
+async function insertProblem(q: Query, courseId: string, input: NewProblemInput): Promise<string> {
+  const rows = await q<{ id: string }>(
     `insert into problems (course_id, unit_number, lecture, label, statement, answer, origin)
      values ($1, $2, $3, $4, $5, $6, 'user')
      returning id`,
@@ -241,86 +278,90 @@ export async function logError(
     existingLines,
   });
 
-  const problemId = await insertProblem(course.id, input);
-
   const redrillOn = redrillDate(today, unitNow, input.unitNumber);
-  const entryRows = await query<EntryRow>(
-    `insert into error_log (
-       course_id, problem_id, logged_on, week_number, unit_number, lecture, student_approach,
-       what_went_wrong, correct_approach, error_types, primary_error_type, lesson, redrill_on
-     )
-     values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-     returning ${ENTRY_RETURNING}`,
-    [
-      course.id,
-      problemId,
-      today,
-      weekNumber,
-      input.unitNumber,
-      lecture,
-      input.studentApproach,
-      diagnosis.whatWentWrong,
-      diagnosis.correctApproach,
-      diagnosis.errorTypes,
-      diagnosis.primaryErrorType,
-      diagnosis.lesson,
-      redrillOn,
-    ],
-  );
-  if (!entryRows?.[0]) throw new Error("Could not save the error log entry");
-  // The returned row wins; what we just wrote fills any column it does not carry (the label lives on problems).
-  const entry = toEntry(entryRows[0], {
-    courseId: course.id,
-    problemId,
-    loggedOn: today,
-    weekNumber,
-    unitNumber: input.unitNumber,
-    lecture,
-    problemLabel: input.label,
-    studentApproach: input.studentApproach,
-    whatWentWrong: diagnosis.whatWentWrong,
-    correctApproach: diagnosis.correctApproach,
-    errorTypes: diagnosis.errorTypes,
-    primaryErrorType: diagnosis.primaryErrorType,
-    lesson: diagnosis.lesson,
-    redrillOn,
-  });
 
-  let pendingLine: MethodLine | null = null;
-  if (diagnosis.methodLine) {
-    const lineRowsOut = await query<MethodLineRow>(
-      `insert into method_lines (
-         course_id, unit_number, lecture, trigger, move, trap, source, origin, status, error_log_id
+  // Every write below lands together or not at all: no orphan problem, and no logged entry without its line.
+  return withTransaction(async (q) => {
+    const problemId = await insertProblem(q, course.id, input);
+
+    const entryRows = await q<EntryRow>(
+      `insert into error_log (
+         course_id, problem_id, logged_on, week_number, unit_number, lecture, student_approach,
+         what_went_wrong, correct_approach, error_types, primary_error_type, lesson, redrill_on
        )
-       values ($1, $2, $3, $4, $5, $6, $7, 'error', 'pending', $8)
-       returning *`,
+       values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+       returning ${ENTRY_RETURNING}`,
       [
         course.id,
+        problemId,
+        today,
+        weekNumber,
         input.unitNumber,
         lecture,
-        diagnosis.methodLine.trigger,
-        diagnosis.methodLine.move,
-        diagnosis.methodLine.trap,
-        `Error log ${today}`,
-        entry.id,
+        input.studentApproach,
+        diagnosis.whatWentWrong,
+        diagnosis.correctApproach,
+        diagnosis.errorTypes,
+        diagnosis.primaryErrorType,
+        diagnosis.lesson,
+        redrillOn,
       ],
     );
-    if (!lineRowsOut?.[0]) throw new Error("Could not save the method line");
-    pendingLine = toMethodLine(lineRowsOut[0], {
+    if (!entryRows?.[0]) throw new Error("Could not save the error log entry");
+    // The returned row wins; what we just wrote fills any column it does not carry (the label lives on problems).
+    const entry = toEntry(entryRows[0], {
       courseId: course.id,
+      problemId,
+      loggedOn: today,
+      weekNumber,
       unitNumber: input.unitNumber,
       lecture,
-      ...diagnosis.methodLine,
-      source: `Error log ${today}`,
-      origin: "error",
-      status: "pending",
-      errorLogId: entry.id,
+      problemLabel: input.label,
+      studentApproach: input.studentApproach,
+      whatWentWrong: diagnosis.whatWentWrong,
+      correctApproach: diagnosis.correctApproach,
+      errorTypes: diagnosis.errorTypes,
+      primaryErrorType: diagnosis.primaryErrorType,
+      lesson: diagnosis.lesson,
+      redrillOn,
     });
-    await query(`update error_log set method_line_id = $1 where id = $2`, [pendingLine.id, entry.id]);
-    entry.methodLineId = pendingLine.id;
-  }
 
-  return { entry, pendingLine };
+    let pendingLine: MethodLine | null = null;
+    if (diagnosis.methodLine) {
+      const lineRowsOut = await q<MethodLineRow>(
+        `insert into method_lines (
+           course_id, unit_number, lecture, trigger, move, trap, source, origin, status, error_log_id
+         )
+         values ($1, $2, $3, $4, $5, $6, $7, 'error', 'pending', $8)
+         returning *`,
+        [
+          course.id,
+          input.unitNumber,
+          lecture,
+          diagnosis.methodLine.trigger,
+          diagnosis.methodLine.move,
+          diagnosis.methodLine.trap,
+          `Error log ${today}`,
+          entry.id,
+        ],
+      );
+      if (!lineRowsOut?.[0]) throw new Error("Could not save the method line");
+      pendingLine = toMethodLine(lineRowsOut[0], {
+        courseId: course.id,
+        unitNumber: input.unitNumber,
+        lecture,
+        ...diagnosis.methodLine,
+        source: `Error log ${today}`,
+        origin: "error",
+        status: "pending",
+        errorLogId: entry.id,
+      });
+      await q(`update error_log set method_line_id = $1 where id = $2`, [pendingLine.id, entry.id]);
+      entry.methodLineId = pendingLine.id;
+    }
+
+    return { entry, pendingLine };
+  });
 }
 
 /** Every entry for the current course, newest first. */
@@ -383,31 +424,41 @@ export async function answerRedrill(errorLogId: string, answer: string): Promise
     studentAnswer: answer,
   });
 
-  await query(
-    `insert into attempts (course_id, kind, error_log_id, problem_id, question, student_answer, passed, feedback)
-     values ($1, 'redrill', $2, $3, $4, $5, $6, $7)`,
-    [course.id, row.id, row.problem_id, row.statement, answer, grade.passed, grade.feedback],
-  );
+  // Plain reads stay outside the transaction. Only an entry that is still open needs a new date.
+  const today = todayISO();
+  const open = row.cleared !== true;
+  const nextRedrill =
+    open && !grade.passed ? redrillDate(today, await getCurrentUnit(course, today), row.unit_number) : null;
 
-  // An entry that is already cleared keeps its state; the attempt above is still recorded.
-  if (row.cleared !== true) {
-    const today = todayISO();
+  await withTransaction(async (q) => {
+    await q(
+      `insert into attempts (course_id, kind, error_log_id, problem_id, question, student_answer, passed, feedback)
+       values ($1, 'redrill', $2, $3, $4, $5, $6, $7)`,
+      [course.id, row.id, row.problem_id, row.statement, answer, grade.passed, grade.feedback],
+    );
+
+    // An entry that is already cleared keeps its state; the attempt above is still recorded.
+    if (!open) return;
+
+    // `cleared = false` makes each update a no-op when a concurrent answer already cleared this entry
+    // while the model was grading: a late miss cannot reschedule it, a late pass cannot clear it twice.
     if (grade.passed) {
-      await query(`update error_log set cleared = true, cleared_on = $2 where id = $1`, [row.id, today]);
-      await query(
-        `insert into shuffle_pile (course_id, problem_id, reason, entered_on)
-         values ($1, $2, 'cleared', $3)
-         on conflict (problem_id) do nothing`,
-        [course.id, row.problem_id, today],
+      const cleared = await q<{ id: string }>(
+        `update error_log set cleared = true, cleared_on = $2 where id = $1 and cleared = false returning id`,
+        [row.id, today],
       );
+      if (cleared.length > 0) {
+        await q(
+          `insert into shuffle_pile (course_id, problem_id, reason, entered_on)
+           values ($1, $2, 'cleared', $3)
+           on conflict (problem_id) do nothing`,
+          [course.id, row.problem_id, today],
+        );
+      }
     } else {
-      const unitNow = await getCurrentUnit(course, today);
-      await query(`update error_log set redrill_on = $2 where id = $1`, [
-        row.id,
-        redrillDate(today, unitNow, row.unit_number),
-      ]);
+      await q(`update error_log set redrill_on = $2 where id = $1 and cleared = false`, [row.id, nextRedrill]);
     }
-  }
+  });
 
   return grade;
 }
@@ -415,14 +466,18 @@ export async function answerRedrill(errorLogId: string, answer: string): Promise
 /** A problem the student got right goes straight to the shuffle pile. */
 export async function logCorrectProblem(input: NewProblemInput): Promise<{ problemId: string }> {
   const course = await getCourse();
-  const problemId = await insertProblem(course.id, input);
-  await query(
-    `insert into shuffle_pile (course_id, problem_id, reason, entered_on)
-     values ($1, $2, 'got_right', $3)
-     on conflict (problem_id) do nothing`,
-    [course.id, problemId, todayISO()],
-  );
-  return { problemId };
+  const today = todayISO();
+  // Both inserts or neither: a failed pile insert must not leave a problem behind for a retry to duplicate.
+  return withTransaction(async (q) => {
+    const problemId = await insertProblem(q, course.id, input);
+    await q(
+      `insert into shuffle_pile (course_id, problem_id, reason, entered_on)
+       values ($1, $2, 'got_right', $3)
+       on conflict (problem_id) do nothing`,
+      [course.id, problemId, today],
+    );
+    return { problemId };
+  });
 }
 
 /** Compile-time check that the functions above match the contract. */

@@ -5,8 +5,7 @@ export async function GET(_req?: Request) {
   try {
     return Response.json(await quizTracker());
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    console.error("GET /api/quiz/tracker failed:", message);
-    return Response.json({ error: message }, { status: 500 });
+    console.error("GET /api/quiz/tracker failed:", error instanceof Error ? error.message : String(error));
+    return Response.json({ error: "Something went wrong. Please try again." }, { status: 500 });
   }
 }

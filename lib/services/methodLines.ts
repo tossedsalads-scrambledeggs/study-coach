@@ -73,13 +73,15 @@ export async function listMethodLines(): Promise<MethodLine[]> {
 }
 
 /**
- * pending -> active, storing the line's embedding. Throws "Duplicate of: <trigger>" when an active
- * line in the same course is a near-duplicate (cosine distance < DUPLICATE_DISTANCE).
+ * pending -> active, storing the line's embedding. Throws "Method line not found" for an unknown id,
+ * "Method line is not pending" for a line that was already decided, and "Duplicate of: <trigger>" when
+ * an active line in the same course is a near-duplicate (cosine distance < DUPLICATE_DISTANCE).
  */
 export async function approveLine(id: string): Promise<MethodLine> {
   const found = await query<MethodLineRow>(`select ${METHOD_LINE_COLUMNS} from method_lines where id = $1`, [id]);
   const row = found[0];
   if (!row) throw new Error("Method line not found");
+  if (row.status !== "pending") throw new Error("Method line is not pending");
 
   const [vector] = await embed([`${row.trigger}. ${row.move}`]);
   if (!vector || vector.length === 0) throw new Error("Could not embed the method line");
@@ -98,13 +100,25 @@ export async function approveLine(id: string): Promise<MethodLine> {
     throw new Error(`Duplicate of: ${closest.trigger}`);
   }
 
+  // `status = 'pending'` makes the write a no-op if the line was decided while we were embedding.
   const updated = await query<MethodLineRow>(
-    `update method_lines set status = 'active', embedding = $1::vector where id = $2 returning ${METHOD_LINE_COLUMNS}`,
+    `update method_lines set status = 'active', embedding = $1::vector
+      where id = $2 and status = 'pending'
+      returning ${METHOD_LINE_COLUMNS}`,
     [literal, id],
   );
-  return toMethodLine(updated[0] ?? { ...row, status: "active" });
+  if (!updated[0]) throw new Error("Method line is not pending");
+  return toMethodLine(updated[0]);
 }
 
+/** pending -> rejected. Throws "Method line not found" or "Method line is not pending" when nothing changed. */
 export async function rejectLine(id: string): Promise<void> {
-  await query("update method_lines set status = 'rejected' where id = $1", [id]);
+  const rejected = await query<{ id: string }>(
+    "update method_lines set status = 'rejected' where id = $1 and status = 'pending' returning id",
+    [id],
+  );
+  if (rejected.length > 0) return;
+
+  const existing = await query<{ id: string }>("select id from method_lines where id = $1", [id]);
+  throw new Error(existing.length > 0 ? "Method line is not pending" : "Method line not found");
 }
