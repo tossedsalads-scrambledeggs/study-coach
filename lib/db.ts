@@ -9,6 +9,8 @@ export function db(): Pool {
     const connectionString = process.env.DATABASE_URL;
     if (!connectionString) throw new Error("DATABASE_URL must be set");
     pool = new Pool({ connectionString, max: 5 });
+    // Neon closes idle connections (scale to zero); without a listener pg's 'error' event crashes the process.
+    pool.on("error", (err) => console.error("Postgres pool error (connection dropped):", err.message));
   }
   return pool;
 }
