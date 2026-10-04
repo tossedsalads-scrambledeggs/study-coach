@@ -230,7 +230,7 @@ export function LogMistakeForm({
               id={id("label")}
               value={label}
               onChange={(e) => setLabel(e.target.value)}
-              placeholder="Ex 4 - Sample Space, part 1"
+              placeholder="e.g. Ex 4 - Sample Space, part 1"
               required
               disabled={busy}
             />
@@ -245,7 +245,7 @@ export function LogMistakeForm({
               step={1}
               value={unit}
               onChange={(e) => setUnit(e.target.value)}
-              placeholder="3"
+              placeholder="e.g. 3"
               className="tabular-nums"
               required
               disabled={busy}
@@ -257,7 +257,7 @@ export function LogMistakeForm({
               id={id("lecture")}
               value={lecture}
               onChange={(e) => setLecture(e.target.value)}
-              placeholder="Lec 7"
+              placeholder="e.g. Lec 7"
               disabled={busy}
             />
           </div>
@@ -285,7 +285,7 @@ export function LogMistakeForm({
               id={id("approach")}
               value={approach}
               onChange={(e) => setApproach(e.target.value)}
-              placeholder="I added the two variances: 4 + 9 = 13."
+              placeholder="e.g. I added the two variances: 4 + 9 = 13."
               className="min-h-24"
               required
               disabled={busy}
@@ -301,7 +301,7 @@ export function LogMistakeForm({
             id={id("answer")}
             value={answer}
             onChange={(e) => setAnswer(e.target.value)}
-            placeholder="Var(X + Y) = 17"
+            placeholder="e.g. Var(X + Y) = 17"
             disabled={busy}
           />
         </div>
