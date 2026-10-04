@@ -1,12 +1,49 @@
 import { gradeQuizAnswer, writeQuizQuestion } from "@/lib/agents/methodQuiz";
 import type { Grade, ISODate, QuizQuestion } from "@/lib/contracts";
-import { query } from "@/lib/db";
+import { db, query } from "@/lib/db";
 import { currentUnit, pickQuizLine, todayISO } from "@/lib/rules";
 import { METHOD_LINE_COLUMNS, currentCourse, toMethodLine } from "@/lib/services/methodLines";
 import type { CourseRow, MethodLineRow } from "@/lib/services/methodLines";
 
 /** How many earlier questions for a line the question writer is told to avoid repeating. */
 const RECENT_QUESTIONS = 5;
+
+/** A query function tied to one connection, so a group of statements shares one transaction. */
+type Query = <T = Record<string, unknown>>(text: string, params?: unknown[]) => Promise<T[]>;
+
+/**
+ * Run a sequence of writes atomically on one pooled connection: commit when `work` resolves, roll back
+ * when it throws. Keep model calls and plain reads outside, since the connection is held until `work` ends.
+ */
+async function withTransaction<T>(work: (q: Query) => Promise<T>): Promise<T> {
+  const client = await db().connect();
+  let broken: Error | undefined;
+  // The pool does not listen to a client that is checked out, so a dropped connection would otherwise
+  // surface as an unhandled 'error' event and take the process down. Remember it and discard the client.
+  const onError = (err: Error) => {
+    broken = err;
+  };
+  client.on("error", onError);
+  try {
+    await client.query("begin");
+    const q: Query = async <R>(text: string, params: unknown[] = []) =>
+      (await client.query(text, params)).rows as R[];
+    const result = await work(q);
+    await client.query("commit");
+    return result;
+  } catch (err) {
+    try {
+      await client.query("rollback");
+    } catch (rollbackErr) {
+      // Unknown connection state: have the pool discard it rather than hand it out again.
+      broken = rollbackErr instanceof Error ? rollbackErr : new Error(String(rollbackErr));
+    }
+    throw err;
+  } finally {
+    client.removeListener("error", onError);
+    client.release(broken);
+  }
+}
 
 interface UnitRow {
   number: number;
@@ -69,14 +106,17 @@ export async function answerQuiz(input: { methodLineId: string; question: string
 
   const grade = await gradeQuizAnswer(line, input.question, input.answer);
 
-  await query(
-    `insert into attempts (course_id, kind, method_line_id, question, student_answer, passed, feedback)
-     values ($1, 'quiz', $2, $3, $4, $5, $6)`,
-    [line.courseId, line.id, input.question, input.answer, grade.passed, grade.feedback],
-  );
-  if (grade.passed) {
-    await query("update method_lines set passed_at = now() where id = $1 and passed_at is null", [line.id]);
-  }
+  // Both writes land together or not at all: a pass never retires a line without its attempt on record.
+  await withTransaction(async (q) => {
+    await q(
+      `insert into attempts (course_id, kind, method_line_id, question, student_answer, passed, feedback)
+       values ($1, 'quiz', $2, $3, $4, $5, $6)`,
+      [line.courseId, line.id, input.question, input.answer, grade.passed, grade.feedback],
+    );
+    if (grade.passed) {
+      await q("update method_lines set passed_at = now() where id = $1 and passed_at is null", [line.id]);
+    }
+  });
   return grade;
 }
 
